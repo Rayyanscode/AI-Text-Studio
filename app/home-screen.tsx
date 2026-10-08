@@ -4,14 +4,6 @@ import { authClient } from "@/lib/auth-client";
 import Link from "next/link";
 import { FormEvent, useState } from "react";
 
-const pieces = [
-  "Blog posts",
-  "Product descriptions",
-  "Emails",
-  "Summaries",
-  "Social posts",
-];
-
 export function HomeScreen() {
   const { data: session, isPending } = authClient.useSession();
   const [mode, setMode] = useState<"sign-in" | "sign-up">("sign-up");
@@ -64,27 +56,9 @@ export function HomeScreen() {
 
       <main className="mx-auto grid w-full max-w-6xl gap-12 px-6 pb-20 lg:grid-cols-[minmax(0,1.1fr)_minmax(320px,420px)] lg:items-start">
         <section className="pt-6 lg:pt-16">
-          <p className="text-sm font-medium tracking-[0.18em] text-accent uppercase">
-            Writing desk.
-          </p>
-          <h1 className="mt-4 max-w-xl font-serif text-5xl leading-[1.05] tracking-tight sm:text-6xl">
-            Finished copy, streamed as it is written.
+          <h1 className="font-serif text-5xl leading-[1.05] tracking-tight sm:text-6xl">
+            AI Text Studio
           </h1>
-          <p className="mt-6 max-w-lg text-lg leading-8 text-muted">
-            Draft blog posts, product descriptions, emails, summaries, and
-            social posts. Set the tone, language, and length, then keep every
-            draft in your history.
-          </p>
-          <ul className="mt-8 flex flex-wrap gap-2">
-            {pieces.map((piece) => (
-              <li
-                key={piece}
-                className="rounded-full border border-line bg-card px-3 py-1.5 text-sm"
-              >
-                {piece}
-              </li>
-            ))}
-          </ul>
         </section>
 
         <section className="rounded-3xl border border-line bg-card p-6 shadow-[0_20px_60px_rgba(28,23,18,0.06)]">

@@ -65,7 +65,7 @@ export function HomeScreen() {
       <main className="mx-auto grid w-full max-w-6xl gap-12 px-6 pb-20 lg:grid-cols-[minmax(0,1.1fr)_minmax(320px,420px)] lg:items-start">
         <section className="pt-6 lg:pt-16">
           <p className="text-sm font-medium tracking-[0.18em] text-accent uppercase">
-            Writing desk
+            Writing desk.
           </p>
           <h1 className="mt-4 max-w-xl font-serif text-5xl leading-[1.05] tracking-tight sm:text-6xl">
             Finished copy, streamed as it is written.
@@ -169,7 +169,10 @@ export function HomeScreen() {
                   />
                 </label>
                 {error ? (
-                  <p className="rounded-2xl bg-accent-soft px-3 py-2 text-sm text-accent" role="alert">
+                  <p
+                    className="rounded-2xl bg-accent-soft px-3 py-2 text-sm text-accent"
+                    role="alert"
+                  >
                     {error}
                   </p>
                 ) : null}

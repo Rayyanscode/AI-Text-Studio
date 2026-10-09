@@ -1,6 +1,7 @@
 "use client";
 
-import { useCompletion } from "@ai-sdk/react";
+import { useChat } from "@ai-sdk/react";
+import { DefaultChatTransport, type UIMessage } from "ai";
 import { authClient } from "@/lib/auth-client";
 import {
   CONTENT_TYPES,
@@ -13,15 +14,15 @@ import {
   formatCost,
   formatTokens,
   type ContentType,
-  type GenerationItem,
   type Language,
   type Length,
   type Tone,
 } from "@/lib/content";
-import { useCallback, useEffect, useRef, useState } from "react";
+import type { ConversationItem } from "@/lib/conversations";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type HistoryResponse = {
-  items: GenerationItem[];
+  items: ConversationItem[];
   usedThisHour: number;
   hourlyLimit: number;
   error?: string;
@@ -29,6 +30,19 @@ type HistoryResponse = {
 
 const fieldClass =
   "mt-1.5 w-full rounded-2xl border border-line bg-paper px-3 py-2.5 text-sm outline-none focus:border-accent";
+
+function newConversationId() {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `c_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function messageText(message: UIMessage) {
+  return (message.parts ?? [])
+    .map((part) => (part.type === "text" ? part.text : ""))
+    .join("");
+}
 
 export function StudioApp({
   user,
@@ -39,21 +53,26 @@ export function StudioApp({
   const [tone, setTone] = useState<Tone>("professional");
   const [language, setLanguage] = useState<Language>("English");
   const [length, setLength] = useState<Length>("medium");
-  const [prompt, setPrompt] = useState("");
-  const [items, setItems] = useState<GenerationItem[]>([]);
+  const [input, setInput] = useState("");
+  const [conversationId, setConversationId] = useState<string>(newConversationId);
+  const [conversations, setConversations] = useState<ConversationItem[]>([]);
   const [usedThisHour, setUsedThisHour] = useState(0);
   const [historyError, setHistoryError] = useState("");
   const [formError, setFormError] = useState("");
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const wasLoading = useRef(false);
-  const selectLatest = useRef(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
-  const { completion, complete, error, isLoading, setCompletion, stop } =
-    useCompletion({
-      api: "/api/generate",
-    });
+  const transport = useMemo(
+    () => new DefaultChatTransport({ api: "/api/generate" }),
+    [],
+  );
+
+  const { messages, sendMessage, status, stop, setMessages, regenerate, error } =
+    useChat({ transport });
+
+  const isLoading = status === "submitted" || status === "streaming";
 
   const loadHistory = useCallback(async () => {
     const response = await fetch("/api/history");
@@ -64,12 +83,8 @@ export function StudioApp({
     }
 
     setHistoryError("");
-    setItems(data.items);
+    setConversations(data.items);
     setUsedThisHour(data.usedThisHour);
-    if (selectLatest.current) {
-      setSelectedId(data.items[0]?.id ?? null);
-      selectLatest.current = false;
-    }
   }, []);
 
   useEffect(() => {
@@ -86,66 +101,98 @@ export function StudioApp({
     wasLoading.current = isLoading;
   }, [isLoading, loadHistory]);
 
-  const selected = items.find((item) => item.id === selectedId) ?? null;
+  useEffect(() => {
+    const node = scrollRef.current;
+    if (node) {
+      node.scrollTop = node.scrollHeight;
+    }
+  }, [messages, isLoading]);
+
   const typeMeta = CONTENT_TYPES.find((item) => item.id === type);
   const shownError = formError || error?.message || "";
   const quotaLeft = Math.max(HOURLY_LIMIT - usedThisHour, 0);
 
-  async function generate() {
-    const nextPrompt = prompt.trim();
-    if (!nextPrompt) {
-      setFormError("Add a prompt before generating.");
+  const activeConversation = conversations.find(
+    (item) => item.clientId === conversationId,
+  );
+  const lastAssistant = [...(activeConversation?.messages ?? [])]
+    .reverse()
+    .find((item) => item.role === "assistant" && item.inputTokens !== undefined);
+
+  function send() {
+    const text = input.trim();
+    if (!text) {
+      setFormError("Write a message before sending.");
       return;
     }
-    if (nextPrompt.length > MAX_PROMPT_LENGTH) {
+    if (text.length > MAX_PROMPT_LENGTH) {
       setFormError(
-        `Keep the prompt under ${MAX_PROMPT_LENGTH.toLocaleString()} characters.`,
+        `Keep each message under ${MAX_PROMPT_LENGTH.toLocaleString()} characters.`,
       );
       return;
     }
+    if (isLoading) return;
 
     setFormError("");
-    setSelectedId(null);
-    selectLatest.current = true;
-    await complete(nextPrompt, {
-      body: { type, tone, language, length },
-    });
+    setInput("");
+    void sendMessage(
+      { text },
+      { body: { type, tone, language, length, conversationId } },
+    );
   }
 
-  async function copyOutput() {
-    if (!completion) return;
+  function newChat() {
+    stop();
+    setMessages([]);
+    setConversationId(newConversationId());
+    setInput("");
+    setFormError("");
+    setPendingDeleteId(null);
+  }
+
+  function openConversation(item: ConversationItem) {
+    stop();
+    setType(item.type);
+    setTone(item.tone);
+    setLanguage(item.language);
+    setLength(item.length);
+    setConversationId(item.clientId);
+    setMessages(
+      item.messages.map((message, index) => ({
+        id: `${item.id}-${index}`,
+        role: message.role,
+        parts: [{ type: "text" as const, text: message.text }],
+      })),
+    );
+    setInput("");
+    setFormError("");
+    setPendingDeleteId(null);
+  }
+
+  async function copyMessage(id: string, text: string) {
+    if (!text) return;
     try {
-      await navigator.clipboard.writeText(completion);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1600);
+      await navigator.clipboard.writeText(text);
+      setCopiedId(id);
+      window.setTimeout(
+        () => setCopiedId((current) => (current === id ? null : current)),
+        1600,
+      );
     } catch {
       setFormError("Could not copy. Select the text and copy it manually.");
     }
   }
 
-  function openItem(item: GenerationItem) {
-    setType(item.type);
-    setTone(item.tone);
-    setLanguage(item.language);
-    setLength(item.length);
-    setPrompt(item.prompt);
-    setCompletion(item.output);
-    setSelectedId(item.id);
-    setFormError("");
-    setPendingDeleteId(null);
-  }
-
-  async function removeItem(id: string) {
+  async function removeConversation(id: string, clientId: string) {
     const response = await fetch(`/api/history/${id}`, { method: "DELETE" });
     if (!response.ok) {
       const data = (await response.json()) as { error?: string };
-      setHistoryError(data.error ?? "Could not delete that draft.");
+      setHistoryError(data.error ?? "Could not delete that chat.");
       return;
     }
 
-    if (selectedId === id) {
-      setSelectedId(null);
-      setCompletion("");
+    if (clientId === conversationId) {
+      newChat();
     }
     setPendingDeleteId(null);
     await loadHistory();
@@ -156,6 +203,8 @@ export function StudioApp({
     window.location.assign("/");
   }
 
+  const lastMessageId = messages[messages.length - 1]?.id;
+
   return (
     <div className="min-h-dvh bg-paper text-ink lg:grid lg:h-dvh lg:grid-rows-[auto_minmax(0,1fr)]">
       <header className="flex items-center justify-between gap-4 border-b border-line px-4 py-3 sm:px-6">
@@ -163,23 +212,26 @@ export function StudioApp({
           <p className="font-serif text-xl tracking-tight">Text Studio</p>
           <p className="text-xs text-muted">{user.email}</p>
         </div>
-        <button
-          type="button"
-          onClick={() => void signOut()}
-          className="rounded-full border border-line px-3 py-1.5 text-sm"
-        >
-          Sign out
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={newChat}
+            className="rounded-full border border-line px-3 py-1.5 text-sm"
+          >
+            New chat
+          </button>
+          <button
+            type="button"
+            onClick={() => void signOut()}
+            className="rounded-full border border-line px-3 py-1.5 text-sm"
+          >
+            Sign out
+          </button>
+        </div>
       </header>
 
-      <div className="lg:grid lg:min-h-0 lg:grid-cols-[320px_minmax(0,1fr)_300px]">
-        <form
-          className="space-y-5 border-b border-line p-4 sm:p-5 lg:overflow-y-auto lg:border-r lg:border-b-0"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void generate();
-          }}
-        >
+      <div className="lg:grid lg:min-h-0 lg:grid-cols-[300px_minmax(0,1fr)_300px]">
+        <aside className="space-y-5 border-b border-line p-4 sm:p-5 lg:overflow-y-auto lg:border-r lg:border-b-0">
           <fieldset>
             <legend className="text-xs font-medium tracking-[0.16em] text-muted uppercase">
               Type
@@ -249,93 +301,166 @@ export function StudioApp({
             </select>
           </label>
 
-          <label className="block text-sm">
-            <span className="text-muted">Prompt</span>
-            <textarea
-              value={prompt}
-              onChange={(event) => setPrompt(event.target.value)}
-              rows={8}
-              maxLength={MAX_PROMPT_LENGTH}
-              placeholder={typeMeta?.hint}
-              className={`${fieldClass} resize-y leading-6`}
-            />
-            <span className="mt-1 block text-xs text-muted">
-              {prompt.length.toLocaleString()} / {MAX_PROMPT_LENGTH.toLocaleString()}
-              {" · "}
-              {quotaLeft} of {HOURLY_LIMIT} left this hour
-            </span>
-          </label>
+          <p className="rounded-2xl border border-line bg-card p-3 text-xs leading-5 text-muted">
+            These controls shape every reply. Change them anytime, then ask for
+            a revision in the chat.
+          </p>
+        </aside>
 
-          <button
-            type="submit"
-            disabled={isLoading}
-            className="h-11 w-full rounded-full bg-accent text-sm font-medium text-white disabled:opacity-60"
+        <section className="flex min-h-[60vh] flex-col lg:min-h-0">
+          <div
+            ref={scrollRef}
+            className="flex-1 overflow-y-auto px-4 py-6 sm:px-6"
           >
-            {isLoading ? "Writing…" : "Generate"}
-          </button>
-        </form>
-
-        <section className="flex min-h-[50vh] flex-col lg:min-h-0">
-          <div className="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3 sm:px-6">
-            <button
-              type="button"
-              onClick={() => void copyOutput()}
-              disabled={!completion}
-              className="rounded-full border border-line px-3 py-1.5 text-sm disabled:opacity-40"
-            >
-              {copied ? "Copied" : "Copy"}
-            </button>
-            <button
-              type="button"
-              onClick={() => void generate()}
-              disabled={isLoading || !prompt.trim()}
-              className="rounded-full border border-line px-3 py-1.5 text-sm disabled:opacity-40"
-            >
-              Regenerate
-            </button>
-            {isLoading ? (
-              <button
-                type="button"
-                onClick={stop}
-                className="rounded-full border border-line px-3 py-1.5 text-sm"
-              >
-                Stop
-              </button>
-            ) : null}
-          </div>
-
-          <div className="flex-1 overflow-y-auto px-4 py-6 sm:px-8">
-            {shownError ? (
-              <p className="mb-4 rounded-2xl bg-accent-soft px-3 py-2 text-sm text-accent" role="alert">
-                {shownError}
-              </p>
-            ) : null}
-            {completion ? (
-              <article
-                className="max-w-2xl font-serif text-lg leading-8 whitespace-pre-wrap"
-                aria-live="polite"
-              >
-                {completion}
-                {isLoading ? <span className="text-accent"> ▍</span> : null}
-              </article>
+            {messages.length === 0 ? (
+              <div className="flex h-full flex-col items-center justify-center text-center">
+                <h1 className="font-serif text-2xl text-ink">
+                  What should we write?
+                </h1>
+                <p className="mt-2 max-w-sm text-sm text-muted">
+                  Start a conversation below. Reply again to refine the draft —
+                  the chat keeps the full context.
+                </p>
+              </div>
             ) : (
-              <p className="max-w-md text-muted">
-                {isLoading
-                  ? "Starting the draft…"
-                  : "Your draft will appear here as it streams in."}
-              </p>
+              <div className="mx-auto w-full max-w-2xl space-y-6">
+                {messages.map((message) => {
+                  const text = messageText(message);
+                  const isUser = message.role === "user";
+                  const isLast = message.id === lastMessageId;
+
+                  if (isUser) {
+                    return (
+                      <div key={message.id} className="flex justify-end">
+                        <div className="max-w-[85%] rounded-3xl rounded-br-md bg-accent-soft px-4 py-2.5 text-sm leading-6 whitespace-pre-wrap">
+                          {text}
+                        </div>
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div key={message.id} className="space-y-2">
+                      <article className="font-serif text-lg leading-8 whitespace-pre-wrap">
+                        {text}
+                        {isLast && isLoading ? (
+                          <span className="text-accent"> ▍</span>
+                        ) : null}
+                      </article>
+                      {text && !(isLast && isLoading) ? (
+                        <div className="flex gap-3 text-xs text-muted">
+                          <button
+                            type="button"
+                            onClick={() => void copyMessage(message.id, text)}
+                            className="hover:text-ink"
+                          >
+                            {copiedId === message.id ? "Copied" : "Copy"}
+                          </button>
+                          {isLast ? (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void regenerate({
+                                  body: {
+                                    type,
+                                    tone,
+                                    language,
+                                    length,
+                                    conversationId,
+                                  },
+                                })
+                              }
+                              className="hover:text-ink"
+                            >
+                              Regenerate
+                            </button>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })}
+
+                {status === "submitted" ? (
+                  <p className="text-sm text-muted">Starting the draft…</p>
+                ) : null}
+              </div>
             )}
           </div>
 
+          <div className="border-t border-line px-4 py-4 sm:px-6">
+            <form
+              className="mx-auto w-full max-w-2xl"
+              onSubmit={(event) => {
+                event.preventDefault();
+                send();
+              }}
+            >
+              {shownError ? (
+                <p
+                  className="mb-2 rounded-2xl bg-accent-soft px-3 py-2 text-sm text-accent"
+                  role="alert"
+                >
+                  {shownError}
+                </p>
+              ) : null}
+              <div className="rounded-3xl border border-line bg-card p-2 focus-within:border-accent">
+                <textarea
+                  value={input}
+                  onChange={(event) => setInput(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey) {
+                      event.preventDefault();
+                      send();
+                    }
+                  }}
+                  rows={2}
+                  maxLength={MAX_PROMPT_LENGTH}
+                  placeholder={
+                    messages.length === 0
+                      ? typeMeta?.hint
+                      : "Ask for a change, or write a new request…"
+                  }
+                  className="max-h-48 min-h-[44px] w-full resize-y bg-transparent px-2 py-1.5 text-sm leading-6 outline-none"
+                />
+                <div className="flex items-center justify-between gap-2 px-1 pt-1">
+                  <span className="text-xs text-muted">
+                    {input.length.toLocaleString()} /{" "}
+                    {MAX_PROMPT_LENGTH.toLocaleString()} · {quotaLeft} of{" "}
+                    {HOURLY_LIMIT} left this hour
+                  </span>
+                  {isLoading ? (
+                    <button
+                      type="button"
+                      onClick={stop}
+                      className="rounded-full border border-line px-4 py-1.5 text-sm"
+                    >
+                      Stop
+                    </button>
+                  ) : (
+                    <button
+                      type="submit"
+                      disabled={!input.trim()}
+                      className="rounded-full bg-accent px-5 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+                    >
+                      Send
+                    </button>
+                  )}
+                </div>
+              </div>
+            </form>
+          </div>
+
           <footer className="border-t border-line px-4 py-3 text-xs text-muted sm:px-6">
-            {selected && !isLoading ? (
+            {lastAssistant && !isLoading ? (
               <p>
-                {formatTokens(selected.inputTokens)} input ·{" "}
-                {formatTokens(selected.outputTokens)} output · estimated{" "}
-                {formatCost(selected.estimatedCostUsd)} on {MODEL_LABEL}
+                {formatTokens(lastAssistant.inputTokens ?? 0)} input ·{" "}
+                {formatTokens(lastAssistant.outputTokens ?? 0)} output ·
+                estimated {formatCost(lastAssistant.estimatedCostUsd ?? 0)} on{" "}
+                {MODEL_LABEL}
               </p>
             ) : (
-              <p>Token use and estimated cost appear after a draft is saved.</p>
+              <p>Token use and estimated cost appear after each reply.</p>
             )}
           </footer>
         </section>
@@ -349,35 +474,41 @@ export function StudioApp({
               {historyError}
             </p>
           ) : null}
-          {items.length === 0 ? (
-            <p className="mt-3 text-sm text-muted">
-              Saved drafts show up here.
-            </p>
+          {conversations.length === 0 ? (
+            <p className="mt-3 text-sm text-muted">Saved chats show up here.</p>
           ) : (
             <ul className="mt-3 space-y-2">
-              {items.map((item) => {
+              {conversations.map((item) => {
                 const label =
                   CONTENT_TYPES.find((entry) => entry.id === item.type)?.label ??
                   item.type;
+                const active = item.clientId === conversationId;
                 return (
-                  <li key={item.id} className="rounded-2xl border border-line bg-card p-3">
+                  <li
+                    key={item.id}
+                    className={`rounded-2xl border bg-card p-3 ${
+                      active ? "border-ink" : "border-line"
+                    }`}
+                  >
                     <button
                       type="button"
-                      onClick={() => openItem(item)}
+                      onClick={() => openConversation(item)}
                       className="w-full text-left"
                     >
                       <span className="text-xs text-muted">
-                        {label} · {formatWhen(item.createdAt)}
+                        {label} · {formatWhen(item.updatedAt)}
                       </span>
                       <span className="mt-1 block text-sm leading-5">
-                        {preview(item.prompt)}
+                        {item.title}
                       </span>
                     </button>
                     {pendingDeleteId === item.id ? (
                       <div className="mt-2 flex gap-2">
                         <button
                           type="button"
-                          onClick={() => void removeItem(item.id)}
+                          onClick={() =>
+                            void removeConversation(item.id, item.clientId)
+                          }
                           className="text-xs text-accent"
                         >
                           Confirm delete
@@ -408,11 +539,6 @@ export function StudioApp({
       </div>
     </div>
   );
-}
-
-function preview(value: string) {
-  const flat = value.replace(/\s+/g, " ").trim();
-  return flat.length > 90 ? `${flat.slice(0, 90)}…` : flat;
 }
 
 function formatWhen(iso: string) {

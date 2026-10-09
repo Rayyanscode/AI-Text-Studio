@@ -1,22 +1,30 @@
 import { anthropic } from "@ai-sdk/anthropic";
 import {
   APICallError,
+  convertToModelMessages,
   createUIMessageStreamResponse,
   streamText,
   toUIMessageStream,
+  type UIMessage,
 } from "ai";
 import {
   HOURLY_LIMIT,
+  MAX_PROMPT_LENGTH,
   MODEL_ID,
   buildInstructions,
   estimateCostUsd,
-  validateGeneration,
+  validateChatSettings,
 } from "@/lib/content";
 import {
   countGenerationsSince,
   generationsCollection,
   hourAgo,
 } from "@/lib/generations";
+import {
+  conversationsCollection,
+  conversationTitle,
+  type ConversationMessage,
+} from "@/lib/conversations";
 import { getSession } from "@/lib/session";
 
 export const maxDuration = 60;
@@ -26,6 +34,13 @@ function textError(message: string, status: number) {
     status,
     headers: { "Content-Type": "text/plain; charset=utf-8" },
   });
+}
+
+function messageText(message: UIMessage) {
+  return (message.parts ?? [])
+    .map((part) => (part.type === "text" ? part.text : ""))
+    .join("")
+    .trim();
 }
 
 function publicModelError(error: unknown) {
@@ -66,9 +81,38 @@ export async function POST(req: Request) {
     return textError("The request body must be JSON.", 400);
   }
 
-  const input = validateGeneration(body);
-  if (typeof input === "string") {
-    return textError(input, 400);
+  const record = (body ?? {}) as Record<string, unknown>;
+
+  const settings = validateChatSettings(record);
+  if (typeof settings === "string") {
+    return textError(settings, 400);
+  }
+
+  const uiMessages = Array.isArray(record.messages)
+    ? (record.messages as UIMessage[])
+    : [];
+  if (uiMessages.length === 0) {
+    return textError("Send a message before generating.", 400);
+  }
+
+  const lastMessage = uiMessages[uiMessages.length - 1];
+  const latestPrompt = lastMessage ? messageText(lastMessage) : "";
+  if (lastMessage?.role !== "user" || !latestPrompt) {
+    return textError("Add a prompt before generating.", 400);
+  }
+  if (latestPrompt.length > MAX_PROMPT_LENGTH) {
+    return textError(
+      `Keep each message under ${MAX_PROMPT_LENGTH.toLocaleString()} characters.`,
+      400,
+    );
+  }
+
+  const conversationId =
+    typeof record.conversationId === "string" && record.conversationId.trim()
+      ? record.conversationId.trim()
+      : null;
+  if (!conversationId) {
+    return textError("The conversation id is missing.", 400);
   }
 
   try {
@@ -85,10 +129,19 @@ export async function POST(req: Request) {
   }
 
   const userId = session.user.id;
+  const modelMessages = await convertToModelMessages(uiMessages);
+
+  const priorMessages: ConversationMessage[] = uiMessages
+    .filter((message) => message.role === "user" || message.role === "assistant")
+    .map((message) => ({
+      role: message.role as ConversationMessage["role"],
+      text: messageText(message),
+    }));
+
   const result = streamText({
     model: anthropic(MODEL_ID),
-    instructions: buildInstructions(input),
-    prompt: input.prompt,
+    instructions: buildInstructions(settings),
+    messages: modelMessages,
     onError({ error }) {
       console.error("generation stream failed:", publicModelError(error));
     },
@@ -98,24 +151,58 @@ export async function POST(req: Request) {
 
       const inputTokens = usage.inputTokens ?? 0;
       const outputTokens = usage.outputTokens ?? 0;
+      const estimatedCostUsd = estimateCostUsd(inputTokens, outputTokens);
 
       try {
         const collection = await generationsCollection();
         await collection.insertOne({
           userId,
-          type: input.type,
-          tone: input.tone,
-          language: input.language,
-          length: input.length,
-          prompt: input.prompt,
+          type: settings.type,
+          tone: settings.tone,
+          language: settings.language,
+          length: settings.length,
+          prompt: latestPrompt,
           output,
           inputTokens,
           outputTokens,
-          estimatedCostUsd: estimateCostUsd(inputTokens, outputTokens),
+          estimatedCostUsd,
           createdAt: new Date(),
         });
       } catch (error) {
         console.error("failed to save generation", error);
+      }
+
+      try {
+        const messages: ConversationMessage[] = [
+          ...priorMessages,
+          { role: "assistant", text: output, inputTokens, outputTokens, estimatedCostUsd },
+        ];
+        const firstUser = messages.find((message) => message.role === "user");
+        const now = new Date();
+
+        const conversations = await conversationsCollection();
+        await conversations.updateOne(
+          { userId, clientId: conversationId },
+          {
+            $set: {
+              title: conversationTitle(firstUser?.text ?? latestPrompt),
+              type: settings.type,
+              tone: settings.tone,
+              language: settings.language,
+              length: settings.length,
+              messages,
+              updatedAt: now,
+            },
+            $setOnInsert: {
+              userId,
+              clientId: conversationId,
+              createdAt: now,
+            },
+          },
+          { upsert: true },
+        );
+      } catch (error) {
+        console.error("failed to save conversation", error);
       }
     },
   });

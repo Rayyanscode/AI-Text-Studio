@@ -83,11 +83,14 @@ const LENGTH_GUIDE: Record<Length, string> = {
   long: "about 550 to 750 words",
 };
 
-export type GenerationInput = {
+export type ChatSettings = {
   type: ContentType;
   tone: Tone;
   language: Language;
   length: Length;
+};
+
+export type GenerationInput = ChatSettings & {
   prompt: string;
 };
 
@@ -143,27 +146,56 @@ export function validateGeneration(body: unknown): GenerationInput | string {
   };
 }
 
-export function buildInstructions(input: GenerationInput) {
-  const kind = CONTENT_TYPES.find((item) => item.id === input.type)?.label;
+export function validateChatSettings(body: unknown): ChatSettings | string {
+  if (!body || typeof body !== "object") {
+    return "Choose the writing controls.";
+  }
+
+  const record = body as Record<string, unknown>;
+
+  if (!isContentType(record.type)) {
+    return "Choose a content type.";
+  }
+  if (!isTone(record.tone)) {
+    return "Choose a tone.";
+  }
+  if (!isLength(record.length)) {
+    return "Choose a length.";
+  }
+  if (!isLanguage(record.language)) {
+    return "Choose a language.";
+  }
+
+  return {
+    type: record.type,
+    tone: record.tone,
+    language: record.language,
+    length: record.length,
+  };
+}
+
+export function buildInstructions(settings: ChatSettings) {
+  const kind = CONTENT_TYPES.find((item) => item.id === settings.type)?.label;
   const shape =
-    input.type === "email"
+    settings.type === "email"
       ? "Start with a subject line, then the email body."
-      : input.type === "blog"
+      : settings.type === "blog"
         ? "Open with a title, then write the post in short sections."
-        : input.type === "social"
+        : settings.type === "social"
           ? "Write a ready-to-post caption. Add a few relevant hashtags only if they help."
-          : input.type === "summary"
+          : settings.type === "summary"
             ? "Summarize only what the user provided. Do not invent facts."
             : "Lead with a headline, then benefit-led product copy.";
 
   return [
-    "You are Text Studio, an editor who writes finished copy.",
-    `Write a ${kind}.`,
+    "You are Text Studio, an editor who writes and revises finished copy over a conversation.",
+    `By default, write a ${kind}.`,
     shape,
-    `Tone: ${input.tone}.`,
-    `Write the entire piece in ${input.language}.`,
-    `Length: ${LENGTH_GUIDE[input.length]}.`,
-    "Return only the finished piece. Do not explain your choices.",
+    `Tone: ${settings.tone}.`,
+    `Write in ${settings.language}.`,
+    `Default length: ${LENGTH_GUIDE[settings.length]}.`,
+    "When the user asks for changes, revise the most recent piece accordingly instead of starting over.",
+    "Return only the finished copy unless the user asks a direct question. Do not explain your choices.",
   ].join(" ");
 }
 

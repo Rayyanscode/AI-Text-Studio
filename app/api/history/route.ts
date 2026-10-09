@@ -1,10 +1,9 @@
 import { HOURLY_LIMIT } from "@/lib/content";
+import { countGenerationsSince, hourAgo } from "@/lib/generations";
 import {
-  countGenerationsSince,
-  generationsCollection,
-  hourAgo,
-  serializeGeneration,
-} from "@/lib/generations";
+  conversationsCollection,
+  serializeConversation,
+} from "@/lib/conversations";
 import { getSession } from "@/lib/session";
 
 export async function GET() {
@@ -14,18 +13,18 @@ export async function GET() {
   }
 
   try {
-    const collection = await generationsCollection();
+    const collection = await conversationsCollection();
     const [docs, usedThisHour] = await Promise.all([
       collection
         .find({ userId: session.user.id })
-        .sort({ createdAt: -1 })
+        .sort({ updatedAt: -1 })
         .limit(40)
         .toArray(),
       countGenerationsSince(session.user.id, hourAgo()),
     ]);
 
     return Response.json({
-      items: docs.map(serializeGeneration),
+      items: docs.map(serializeConversation),
       usedThisHour,
       hourlyLimit: HOURLY_LIMIT,
     });
